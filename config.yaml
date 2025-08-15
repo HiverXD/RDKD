@@ -1,0 +1,83 @@
+# config.yaml (repo root)
+project: RDKD
+exp_name: "01_baseline_test"
+seed: 3407
+device: "cuda"         # "cpu" 가능
+precision: "fp32"      # "bf16"/"fp16" 도입시 여기서 제어
+
+# output dir format
+output:
+  dir: "runs/${exp_name}/${data.dataset}"
+  namefmt: "%Y%m%d_%H%M%S"   # 폴더 타임스탬프
+
+data:
+  root: "dataset"       # data_setup.py의 root와 일치
+  dataset: "cifar10"    # 기본값 (override에서 바뀜)
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+  download: true
+  aug:                  # data_setup.py를 쓰되, 강화 옵션 켜고/끄기 토글
+    enable: true
+    cifar:
+      random_crop_pad: 4
+      horizontal_flip_p: 0.5
+      cutout: 0         # 0이면 끔 (px)
+    mnist_like:
+      random_crop_pad: 0
+      horizontal_flip_p: 0.0
+
+model:
+  backbone: "resnet18"      # student
+  num_classes: 10           # override에서 dataset별로 조정
+  ckpts:
+    teacher: "src/model/ckpts/resnet34.pt"
+    student: null
+  load_pretrained: true
+  strict_load: false
+
+train:
+  test_every: 1
+  epochs: 100               # 전체 학습 총 epoch (linear_probe + finetune 합)
+  linear_probe:
+    enable: true
+    epochs: 20
+    freeze_bn: true
+  finetune:
+    enable: true
+    epochs: 80
+
+  optimizer:
+    name: "AdamW"
+    lr: 3.0e-4
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  scheduler:
+    name: "cosine"          # LambdaLR로 warmup+cosine 구성
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+
+logging:
+  wandb: false
+  project: "RDKD"
+  entity: null
+  tags: ["baseline"]
+
+eval:
+  metrics: ["acc", "recall", "f1", "top5"]
+
+kd:                         # (2단계 대비 자리만 잡아둠; baseline에선 꺼짐)
+  enable: false
+  alpha: 0.5
+  temperature: 4.0
+
+rdkd:                       # (3~4단계 대비 자리만 잡아둠; baseline에선 0)
+  dynamic_beta: 0.0
+  relational_gamma: 0.0
+  proj:
+    type: "gaussian"
+    k: 64
+    heads: 1
+    seed: 42
