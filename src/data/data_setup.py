@@ -51,7 +51,7 @@ def _prepare_tiny_imagenet_val(root):
                 shutil.copy2(src, dst)
     return out_dir
 
-def loaders(batch_size=128, root="dataset", num_workers=4, pin_memory=True, download=True):
+def loaders(batch_size=128, root="dataset", num_workers=4, pin_memory=True, download=False):
     # --- stats ---
     # CIFAR-10/100 (기존)
     cifar10_mean = (0.4914, 0.4822, 0.4465)
