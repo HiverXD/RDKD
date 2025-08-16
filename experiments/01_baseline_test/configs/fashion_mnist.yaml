@@ -1,6 +1,0 @@
-data:
-  dataset: "fashion_mnist"
-model:
-  num_classes: 10
-logging:
-  tags: ["baseline", "fashion_mnist"]

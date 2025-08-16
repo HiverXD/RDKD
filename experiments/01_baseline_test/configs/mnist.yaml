@@ -1,6 +1,0 @@
-data:
-  dataset: "mnist"
-model:
-  num_classes: 10
-logging:
-  tags: ["baseline", "mnist"]

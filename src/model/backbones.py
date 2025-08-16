@@ -2,6 +2,7 @@
 import os
 import torch
 import torch.nn as nn
+import copy
 
 # Safe import in case of torchvision API changes
 try:
@@ -92,6 +93,13 @@ def build_classifier(ckpt_path: str, num_classes: int, freeze_backbone: bool = F
 
     model.to(device)
     return model
+
+def export_backbone_from_classifier(model: nn.Module, arch: str, save_path: str):
+    feat_dim = model.fc.in_features
+    m = copy.deepcopy(model)
+    m.fc = nn.Identity()
+    ckpt = {"arch": arch, "feature_dim": feat_dim, "state_dict": m.state_dict()}
+    torch.save(ckpt, save_path)
 
 if __name__ == "__main__":
     # Save backbones when run as a standalone script
