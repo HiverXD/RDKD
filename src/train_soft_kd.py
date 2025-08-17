@@ -5,58 +5,47 @@ from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import LambdaLR
 import torch.nn.functional as F
 
+from src.utils.config import load_config_from_cli, expand_softkd_templates
 from src.utils.trainer import Trainer
-from src.utils.config import load_config_merged
 from src.data.indexed import WithIndex, collate_with_index
 from src.data.soft_targets import TeacherLogitsBank
 from src.losses.soft_kd import SoftTargetKDLoss
 from src.losses.compute_soft_kd_loss import make_compute_loss_kd
 from src.model.load_teacher import load_backbone_and_classifier, load_student_imagenet
 
-
-# ----------------------------
-# helpers: path/template resolve
-# ----------------------------
-def _expand_softkd_templates(cfg):
-    """dataset만으로 teacher ckpt, cache 경로 자동 확장"""
-    ds = cfg["data"]["dataset"]
-    # teacher paths via template
-    t = cfg["model"]["teacher"]
-    t.setdefault("template_backbone", "src/model/ckpts/resnet34_{dataset}_backbone.pt")
-    t.setdefault("template_classifier", "src/model/ckpts/resnet34_{dataset}_classifier.pt")
-    t.setdefault("arch", "resnet34")
-
-    if "backbone_path" not in t:
-        t["backbone_path"] = t["template_backbone"].format(dataset=ds)
-    if "classifier_path" not in t:
-        t["classifier_path"] = t["template_classifier"].format(dataset=ds)
-
-    # student
-    s = cfg["model"]["student"]
-    s.setdefault("arch", "resnet18")
-    s.setdefault("ckpt", "src/model/ckpts/ResNet18.pt")
-
-    # kd cache
-    kd = cfg["kd"]
-    kd.setdefault("cache_logits", True)
-    kd.setdefault("cache_template", "src/model/ckpts/soft_targets/{dataset}_fp16.pt")
-    if kd.get("cache_logits", False) and "cache_path" not in kd:
-        kd["cache_path"] = kd["cache_template"].format(dataset=ds)
-    return cfg
-
-
 # ----------------------------
 # dataloaders (증강 없음)
 # ----------------------------
 def build_datasets(cfg):
-    """기존 data_setup 엔트리 사용 (증강 없음 가정)"""
-    from src.data.data_setup import build_dataset_pair  # (train_ds, val_ds) 반환 가정
-    return build_dataset_pair(cfg["data"])
+    """
+    returns: base_train_ds, base_val_ds (torch.utils.data.Dataset)
+    data_setup.loaders(...)는 {name: DataLoader} 딕셔너리를 반환하므로,
+    cfg["data"]["dataset"] 키로 해당 DataLoader를 선택 → .dataset 추출.
+    """
+    from src.data.data_setup import loaders
+    dl_train_dict, dl_val_dict = loaders(
+        batch_size=cfg["data"]["batch_size"],
+        root=cfg["data"]["root"],
+        num_workers=cfg["data"]["num_workers"],
+        pin_memory=cfg["data"].get("pin_memory", True),
+        download=cfg["data"].get("download", False),
+    )
+    ds_name = cfg["data"]["dataset"]
+    if ds_name not in dl_train_dict or ds_name not in dl_val_dict:
+        raise KeyError(f"Dataset '{ds_name}' not found in data_setup.loaders(...) return keys: "
+                       f"{list(dl_train_dict.keys())}")
+    base_train = dl_train_dict[ds_name].dataset
+    base_val   = dl_val_dict[ds_name].dataset
+    return base_train, base_val
 
 def build_dataloaders(cfg, return_indices=True):
     base_train, base_val = build_datasets(cfg)
-    train_ds = WithIndex(base_train) if return_indices else base_train
-    val_ds   = WithIndex(base_val)   if return_indices else base_val
+    if return_indices:
+        train_ds = WithIndex(base_train)
+        val_ds   = WithIndex(base_val)
+        collate  = collate_with_index
+    else:
+        train_ds, val_ds, collate = base_train, base_val, None
 
     train_loader = DataLoader(
         train_ds,
@@ -64,7 +53,8 @@ def build_dataloaders(cfg, return_indices=True):
         shuffle=True,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=cfg["data"].get("pin_memory", True),
-        collate_fn=collate_with_index if return_indices else None,
+        persistent_workers=(cfg["data"]["num_workers"] > 0),
+        collate_fn=collate,
     )
     val_loader = DataLoader(
         val_ds,
@@ -72,7 +62,8 @@ def build_dataloaders(cfg, return_indices=True):
         shuffle=False,
         num_workers=cfg["data"]["num_workers"],
         pin_memory=cfg["data"].get("pin_memory", True),
-        collate_fn=collate_with_index if return_indices else None,
+        persistent_workers=(cfg["data"]["num_workers"] > 0),
+        collate_fn=collate,
     )
     return train_loader, val_loader
 
@@ -81,24 +72,24 @@ def build_dataloaders(cfg, return_indices=True):
 # model builders
 # ----------------------------
 def build_teacher(cfg, device):
-    nc = cfg["model"]["num_classes"]
+    nc  = cfg["model"]["num_classes"]
+    arc = cfg["model"]["teacher"]["arch"]
     tbb = cfg["model"]["teacher"]["backbone_path"]
     tcl = cfg["model"]["teacher"]["classifier_path"]
-    teacher = load_backbone_and_classifier(tbb, tcl, cfg["model"]["teacher"]["arch"], nc, map_location="cpu").to(device)
+    teacher = load_backbone_and_classifier(tbb, tcl, arc, nc, map_location="cpu").to(device)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
     return teacher
 
 def build_student(cfg, device):
-    nc = cfg["model"]["num_classes"]
-    sckpt = cfg["model"]["student"]["ckpt"]
-    student = load_student_imagenet(sckpt, nc, map_location="cpu").to(device)
+    nc   = cfg["model"]["num_classes"]
+    sckp = cfg["model"]["student"]["ckpt"]
+    student = load_student_imagenet(sckp, nc, map_location="cpu").to(device)
     return student
 
-
 # ----------------------------
-# optimizer / scheduler
+# optimizer / scheduler (AdamW 기본)
 # ----------------------------
 def build_optimizer_scheduler(cfg, model):
     opt_cfg = cfg["train"]["optimizer"]
@@ -119,8 +110,8 @@ def build_optimizer_scheduler(cfg, model):
         optim = AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
     sch_cfg = cfg.get("train", {}).get("scheduler", {"name": "cosine", "warmup_epochs": 0, "min_lr": 0.0})
-    total_epochs = cfg["train"]["linear_probe"]["epochs"] * int(cfg["train"]["linear_probe"]["enable"]) + \
-                   cfg["train"]["finetune"]["epochs"] * int(cfg["train"]["finetune"]["enable"])
+    total_epochs = (cfg["train"]["linear_probe"]["epochs"] if cfg["train"]["linear_probe"]["enable"] else 0) + \
+                   (cfg["train"]["finetune"]["epochs"] if cfg["train"]["finetune"]["enable"] else 0)
 
     warm = sch_cfg.get("warmup_epochs", 0)
     min_lr = sch_cfg.get("min_lr", 0.0)
@@ -129,64 +120,64 @@ def build_optimizer_scheduler(cfg, model):
         if epoch < warm:
             return (epoch + 1) / max(1, warm)
         # cosine from warm..total
+        if total_epochs <= warm:
+            return min_lr / lr
         t = (epoch - warm) / max(1, total_epochs - warm)
         return min_lr / lr + (1 - min_lr / lr) * (0.5 * (1 + math.cos(math.pi * t)))
 
     scheduler = LambdaLR(optim, lr_lambda=lr_lambda)
     return optim, scheduler
 
-
 # ----------------------------
-# evaluation (val 에서는 CE 기준)
+# evaluation (val에서는 CE 기준)
 # ----------------------------
 @torch.no_grad()
 def evaluate(student, val_loader, device, epoch, jsonl_path):
     student.eval()
     seen, loss_sum, acc_sum = 0, 0.0, 0.0
     for batch in val_loader:
-        if len(batch) == 3:
-            x, y, _ = batch
-        else:
-            x, y = batch
+        if len(batch) == 3: x, y, _ = batch
+        else: x, y = batch
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         logits = student(x)
         loss = F.cross_entropy(logits, y)
         acc = (logits.argmax(1) == y).float().mean().item()
-        bs = x.size(0)
-        seen += bs
+        bs = x.size(0); seen += bs
         loss_sum += loss.item() * bs
-        acc_sum += acc * bs
+        acc_sum  += acc * bs
 
-    metrics = {
-        "epoch": int(epoch),
-        "mode": "val",
-        "val_loss_total": loss_sum / max(1, seen),
-        "val_acc": acc_sum / max(1, seen),
-    }
+    metrics = {"epoch": int(epoch), "mode": "val",
+               "val_loss_total": loss_sum / max(1, seen),
+               "val_acc": acc_sum / max(1, seen)}
     os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
     with open(jsonl_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
     return metrics
 
-
 # ----------------------------
-# run
+# main
 # ----------------------------
 def main():
-    cfg = load_config_merged()               # 루트 + 실험 override 병합
-    cfg = _expand_softkd_templates(cfg)      # 템플릿 경로 채움
+    cfg = load_config_from_cli()         # <-- 변경: load_config_merged -> load_config_from_cli
+    cfg = expand_softkd_templates(cfg)   # 템플릿 경로 자동 확장
 
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
     # 출력 경로: runs/<experiment.name>/<dataset>
     exp_name = cfg["experiment"]["name"]
-    dataset = cfg["data"]["dataset"]
+    dataset  = cfg["data"]["dataset"]
     out = os.path.join(cfg["output"]["dir"], exp_name, dataset)
     os.makedirs(os.path.join(out, "checkpoints"), exist_ok=True)
-    # 병합본 저장
+
+    # config_used 저장(예쁘게)
     with open(os.path.join(out, "config_used.yaml"), "w", encoding="utf-8") as f:
-        f.write(cfg.get("_merged_yaml_text", ""))
+        # 원본 pretty printer가 있으면 사용, 없으면 json으로라도 남김
+        try:
+            from src.utils.config import pretty
+            f.write(pretty(cfg))
+        except Exception:
+            f.write(json.dumps(cfg, ensure_ascii=False, indent=2))
 
     # 데이터/모델
     train_loader, val_loader = build_dataloaders(cfg, return_indices=True)
@@ -196,12 +187,15 @@ def main():
     # 캐시
     bank = None
     if cfg["kd"].get("cache_logits", True):
-        cache_path = cfg["kd"]["cache_path"]
-        bank = TeacherLogitsBank(cache_path, num_samples=len(train_loader.dataset),
-                                 num_classes=cfg["model"]["num_classes"], device=device)
+        bank = TeacherLogitsBank(cfg["kd"]["cache_path"],
+                                 num_samples=len(train_loader.dataset),
+                                 num_classes=cfg["model"]["num_classes"],
+                                 device=device)
         if not bank.exists():
-            cache_loader = DataLoader(train_loader.dataset, batch_size=cfg["data"]["batch_size"],
-                                      shuffle=False, num_workers=cfg["data"]["num_workers"],
+            cache_loader = DataLoader(train_loader.dataset,
+                                      batch_size=cfg["data"]["batch_size"],
+                                      shuffle=False,
+                                      num_workers=cfg["data"]["num_workers"],
                                       pin_memory=cfg["data"].get("pin_memory", True),
                                       collate_fn=collate_with_index)
             bank.build(teacher, cache_loader)
@@ -211,20 +205,18 @@ def main():
     compute_loss = make_compute_loss_kd(student, kd_loss, teacher=None if bank else teacher, bank=bank)
 
     optim, sched = build_optimizer_scheduler(cfg, student)
-    trainer = Trainer(model=student, optim=optim, sched=sched,
+    trainer = Trainer(model=student, optimizer=optim, scheduler=sched,
                       amp=(cfg.get("precision", "fp32") == "fp16"),
-                      out_dir=out)
+                      output_dir=out)
 
     best = -1.0
     ep_total = 0
 
     # Linear Probe (백본 freeze)
     if cfg["train"]["linear_probe"]["enable"]:
-        for p in student.parameters():
-            p.requires_grad_(False)
-        for p in student.fc.parameters():
-            p.requires_grad_(True)
-        for epoch in range(cfg["train"]["linear_probe"]["epochs"]):
+        for p in student.parameters(): p.requires_grad_(False)
+        for p in student.fc.parameters(): p.requires_grad_(True)
+        for _ in range(cfg["train"]["linear_probe"]["epochs"]):
             trainer._epoch_loop(train_loader, "train", compute_loss, device, ep_total,
                                 os.path.join(out, "metrics_per_epoch.jsonl"))
             val_m = evaluate(student, val_loader, device, ep_total,
@@ -236,15 +228,13 @@ def main():
                 with open(os.path.join(out, "best_metrics.json"), "w") as f:
                     json.dump({"epoch": ep_total, "val_acc": best}, f)
             torch.save(student.state_dict(), os.path.join(out, "checkpoints", "last.pt"))
-            if sched is not None:
-                sched.step()
+            if sched is not None: sched.step()
             ep_total += 1
 
     # Fine-tune (전체 unfreeze)
     if cfg["train"]["finetune"]["enable"]:
-        for p in student.parameters():
-            p.requires_grad_(True)
-        for epoch in range(cfg["train"]["finetune"]["epochs"]):
+        for p in student.parameters(): p.requires_grad_(True)
+        for _ in range(cfg["train"]["finetune"]["epochs"]):
             trainer._epoch_loop(train_loader, "train", compute_loss, device, ep_total,
                                 os.path.join(out, "metrics_per_epoch.jsonl"))
             val_m = evaluate(student, val_loader, device, ep_total,
@@ -256,10 +246,8 @@ def main():
                 with open(os.path.join(out, "best_metrics.json"), "w") as f:
                     json.dump({"epoch": ep_total, "val_acc": best}, f)
             torch.save(student.state_dict(), os.path.join(out, "checkpoints", "last.pt"))
-            if sched is not None:
-                sched.step()
+            if sched is not None: sched.step()
             ep_total += 1
-
 
 if __name__ == "__main__":
     main()

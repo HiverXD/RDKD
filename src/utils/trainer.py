@@ -37,7 +37,7 @@ class Trainer:
         self.out_dir = Path(output_dir); (self.out_dir/"checkpoints").mkdir(parents=True, exist_ok=True)
 
         self.amp = amp and self.device.type == "cuda"
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
+        self.scaler = torch.amp.GradScaler(device=device, enabled=self.amp)
         self.compute_loss = compute_loss
         self.log_interval = log_interval
         self.early_stopping = early_stopping or {"enabled": False, "patience": 10, "monitor": "val_acc"}
@@ -204,10 +204,10 @@ class Trainer:
             loss, metrics = compute_loss(self.model, batch, mode, step, epoch, device)
 
             if mode == "train":
-                self.optim.zero_grad(set_to_none=True)
+                self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                (self.scaler.step(self.optim) if hasattr(self, "scaler") else self.optim.step())
-                if self.sched is not None: self.sched.step()
+                (self.scaler.step(self.optimizer) if hasattr(self, "scaler") else self.optimizer.step())
+                if self.scheduler is not None: self.scheduler.step()
 
             bs = batch[0].size(0) if isinstance(batch, (tuple, list)) else 1
             seen += bs
