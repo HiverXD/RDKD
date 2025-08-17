@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import json, os, torch
+from collections import defaultdict
 
 ScheduleMode = Literal["step", "epoch", "plateau"]
 
@@ -193,3 +195,35 @@ class Trainer:
         with open(self.out_dir / "metrics_per_epoch.jsonl", "w", encoding="utf-8") as f:
             for row in self.history:
                 f.write(json.dumps(row) + "\n")
+
+    def _epoch_loop(self, loader, mode, compute_loss, device, epoch, jsonl_path):
+        self.model.train(mode == "train")
+        meter, seen = defaultdict(float), 0
+
+        for step, batch in enumerate(loader):
+            loss, metrics = compute_loss(self.model, batch, mode, step, epoch, device)
+
+            if mode == "train":
+                self.optim.zero_grad(set_to_none=True)
+                loss.backward()
+                (self.scaler.step(self.optim) if hasattr(self, "scaler") else self.optim.step())
+                if self.sched is not None: self.sched.step()
+
+            bs = batch[0].size(0) if isinstance(batch, (tuple, list)) else 1
+            seen += bs
+            # total도 포함해서 모든 metric 누적
+            for k, v in metrics.items():
+                v = v.item() if hasattr(v, "item") else float(v)
+                meter[f"{mode}_{k}"] += v * bs
+
+        # 에폭 평균
+        epoch_metrics = {"epoch": int(epoch), "mode": mode}
+        for k, v in list(meter.items()):
+            epoch_metrics[k] = v / max(1, seen)
+
+        # jsonl append (001 포맷 유지)
+        if jsonl_path:
+            os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(epoch_metrics, ensure_ascii=False) + "\n")
+        return epoch_metrics

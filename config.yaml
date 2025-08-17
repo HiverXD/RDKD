@@ -4,7 +4,8 @@ device: "cuda"
 precision: "fp32"
 
 experiment:
-  name: "01_baseline_test"
+#  name: "01_baseline_test"
+  name: "02_soft_kd"
 
 output:
   dir: "runs"           # train.py가 runs/<experiment.name>/<dataset>로 조합
@@ -61,6 +62,10 @@ eval:
 
 kd:
   enable: false
+  alpha: 0.7
+  temperature: 3.0
+  cache_logits: true         # 02에서 기본 on
+  cache_template: "src/model/ckpts/soft_targets/{dataset}_fp16.pt"  # 자동 생성 경로
 
 rdkd:
   dynamic_beta: 0.0
