@@ -1,7 +1,7 @@
-# src/losses/compute_relational_kd_loss.py
+# src/losses/compute_relational_kd_loss_quick_2.py
 from typing import Dict, Tuple
 import torch
-from src.losses.relational_kd import cos_gram_mse
+from src.losses.relational_kd_quick_2 import cos_gram_mse
 
 def make_compute_relational_kd_loss(center: bool = True,
                                     offdiag_only: bool = True):

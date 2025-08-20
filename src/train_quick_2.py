@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from src.utils.config import load_config, expand_softkd_templates, save_config_used
 from src.data.soft_targets import TeacherLogitsBank
 from src.losses.soft_kd import SoftTargetKDLoss
-from src.losses.compute_relational_kd_loss import make_compute_relational_kd_loss
+from src.losses.compute.compute_relational_kd_loss_quick_2 import make_compute_relational_kd_loss
 
 # ---------- helpers ----------
 DATASET_NUM_CLASSES = {
