@@ -18,42 +18,8 @@ def _deep_update(dst: dict, src: dict) -> dict:
             dst[k] = v
     return dst
 
-def load_config(root_cfg_path: str | Path, override_paths: list[str | Path] | None = None) -> dict:
-    root_cfg_path = Path(root_cfg_path)
-    with root_cfg_path.open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    for p in override_paths or []:
-        p = Path(p)
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                _deep_update(cfg, yaml.safe_load(f))
-        else:
-            raise FileNotFoundError(f"Override file not found: {p}")
-
-    # runtime 보조 필드 (참고: outdir 실제 사용은 train에서 조합)
-    now = dt.datetime.now()
-    namefmt = cfg["output"].get("namefmt", "%Y%m%d_%H%M%S")
-    runstamp = now.strftime(namefmt)
-    cfg["_runtime"] = {"runstamp": runstamp}
-    return cfg
-
 def pretty(cfg: dict) -> str:
     return yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True)
-
-def load_config_from_cli() -> dict:
-    """
-    --config <path> 를 여러 번 받을 수 있게 해주는 간단 CLI 로더.
-    첫 번째가 root, 이후가 override로 해석됩니다.
-    """
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", action="append", required=True,
-                        help="config.yaml (root) and any number of overrides")
-    args = parser.parse_args()
-    cfg_paths = args.config
-    root, overrides = cfg_paths[0], cfg_paths[1:]
-    cfg = load_config(root, overrides)
-    return cfg
 
 def expand_softkd_templates(cfg: dict) -> dict:
     """
@@ -95,6 +61,40 @@ def expand_softkd_templates(cfg: dict) -> dict:
                          os.path.join(ckpt_root, "soft_targets/{dataset}_fp16.pt")))
         kd.setdefault("cache_path", cache_tmpl.format(dataset=ds))
 
+    return cfg
+
+def load_config(root_cfg_path: str | Path, override_paths: list[str | Path] | None = None) -> dict:
+    root_cfg_path = Path(root_cfg_path)
+    with root_cfg_path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    for p in override_paths or []:
+        p = Path(p)
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                _deep_update(cfg, yaml.safe_load(f))
+        else:
+            raise FileNotFoundError(f"Override file not found: {p}")
+
+    # runtime 보조 필드 (참고: outdir 실제 사용은 train에서 조합)
+    now = dt.datetime.now()
+    namefmt = cfg["output"].get("namefmt", "%Y%m%d_%H%M%S")
+    runstamp = now.strftime(namefmt)
+    cfg["_runtime"] = {"runstamp": runstamp}
+    return cfg
+
+def load_config_from_cli() -> dict:
+    """
+    --config <path> 를 여러 번 받을 수 있게 해주는 간단 CLI 로더.
+    첫 번째가 root, 이후가 override로 해석됩니다.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", action="append", required=True,
+                        help="config.yaml (root) and any number of overrides")
+    args = parser.parse_args()
+    cfg_paths = args.config
+    root, overrides = cfg_paths[0], cfg_paths[1:]
+    cfg = load_config(root, overrides)
     return cfg
 
 def save_config_used(cfg, out, filename="config_used.yaml", add_meta=True):

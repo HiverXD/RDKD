@@ -1,4 +1,4 @@
-# src/losses/compute_relational_kd.py
+# src/losses/compute_relational_kd_loss.py
 from typing import Dict
 import torch
 from src.losses.relational_kd import cos_gram_mse
