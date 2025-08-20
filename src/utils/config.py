@@ -6,6 +6,9 @@ import copy
 import datetime as dt
 import os, json
 import argparse
+from copy import deepcopy
+from datetime import datetime, timezone
+import subprocess
 
 def _deep_update(dst: dict, src: dict) -> dict:
     for k, v in src.items():
@@ -93,3 +96,42 @@ def expand_softkd_templates(cfg: dict) -> dict:
         kd.setdefault("cache_path", cache_tmpl.format(dataset=ds))
 
     return cfg
+
+def save_config_used(cfg, out, filename="config_used.yaml", add_meta=True):
+    """
+    Write the resolved config as YAML to `out/filename` (if `out` is a directory)
+    or directly to `out` (if it's a .yml/.yaml file path).
+
+    - Creates parent dirs if needed
+    - Preserves key order and unicode
+    - Optionally adds minimal metadata (_meta) with timestamp and git commit
+    """
+    out = Path(out)
+    if out.suffix.lower() in {".yml", ".yaml"}:
+        file_path = out
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out.mkdir(parents=True, exist_ok=True)
+        file_path = out / filename
+
+    payload = deepcopy(cfg)
+    if add_meta:
+        meta = {
+            "saved_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        }
+        try:
+            # best effort: add short git commit if available
+            githash = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if githash:
+                meta["git_commit"] = githash
+        except Exception:
+            pass
+        payload = {"_meta": meta, **payload}
+
+    with file_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+
+    return str(file_path)
