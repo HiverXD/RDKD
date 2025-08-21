@@ -75,7 +75,7 @@ rkd:
   beta_schedule:
     start_epoch: 21
     end_epoch: 30
-    base: 50.0
+    base: 50
     stepwise: true
 
 rdkd:

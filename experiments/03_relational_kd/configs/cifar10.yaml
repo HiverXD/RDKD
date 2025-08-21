@@ -4,3 +4,5 @@ model:
   num_classes: 10
 kd:
   enable: true
+rkd:
+  enable: false

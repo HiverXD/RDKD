@@ -1,240 +1,412 @@
 # src/train_rkd.py
-import argparse
-import json
-import math
-import os
+from __future__ import annotations
+import argparse, json, math, os, time
 from pathlib import Path
 from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-import torchvision
-import torchvision.transforms as T
-import yaml
+from torch.utils.data import DataLoader
+from torch.optim import AdamW, SGD
+from torch.optim.lr_scheduler import LambdaLR
+from tqdm.auto import tqdm
 
-# --- repo losses (고정 import, 분기 없음) ---
+# ---- data ----
+from src.data.data_setup import loaders
+from src.data.indexed import WithIndex, collate_with_index
+from src.data.soft_targets import TeacherLogitsBank
+from src.data.final_embeddings import TeacherEmbeddingBank
+
+# ---- models / loaders ----
+from src.model.load_teacher import load_backbone_and_classifier, load_student_imagenet
+
+# ---- utils ----
+from src.utils.config import load_config, expand_softkd_templates, pretty
+from src.utils.schedulers import BetaScheduler, BetaScheduleCfg
+
+# ---- losses ----
 from src.losses.soft_kd import SoftTargetKDLoss
+from src.losses.relational_kd import cos_gram_mse
 from src.losses.compute.compute_relational_kd_loss import compute_rkd_loss
 
-# --- teacher banks ---
-from src.data.soft_targets import TeacherLogitsBank as SoftTargetBank
-from src.data.final_embeddings import TeacherEmbeddingBank as FinalEmbeddingBank
-from src.data.indexed import collate_with_index
+# ----------------------------
+# Config CLI (root + overrides)
+# ----------------------------
+def load_cfg_from_cli() -> dict:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", action="append", required=True,
+                        help="first is root config, the rest are overrides")
+    args = parser.parse_args()
+    root, overrides = args.config[0], args.config[1:]
+    cfg = load_config(root, overrides)
+    cfg = expand_softkd_templates(cfg)  # teachers.json/템플릿 경로 자동 확장 (soft_kd와 동일)
+    return cfg
 
-# ---------------------------------------------------------
-# 유틸
-# ---------------------------------------------------------
-def load_yaml(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-def deep_merge(base: dict, override: dict) -> dict:
-    out = dict(base)
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-def format_templates(cfg: dict) -> dict:
-    """{dataset} 같은 템플릿 문자열을 config 값으로 치환"""
-    ds = cfg.get("data", {}).get("dataset", "")
-    def _fmt(x):
-        if isinstance(x, str):
-            try:
-                return x.format(dataset=ds)
-            except Exception:
-                return x
-        if isinstance(x, dict):
-            return {k: _fmt(v) for k, v in x.items()}
-        if isinstance(x, list):
-            return [_fmt(i) for i in x]
-        return x
-    return _fmt(cfg)
-
-def save_config_used(dst_dir: Path, cfg: dict):
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    (dst_dir / "config_used.yaml").write_text(
-        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8"
+# ----------------------------
+# Dataloaders (WithIndex; (x,y,idx))
+# ----------------------------
+def build_dataloaders_single(cfg):
+    """data_setup.loaders()에서 원하는 dataset 하나만 골라, .dataset을 꺼내 WithIndex로 감싸 새 DataLoader 생성"""
+    ds_key = cfg["data"]["dataset"]
+    train_dict, val_dict = loaders(
+        batch_size=cfg["data"]["batch_size"],
+        root=cfg["data"]["root"],
+        num_workers=cfg["data"]["num_workers"],
+        pin_memory=cfg["data"].get("pin_memory", True),
+        download=cfg["data"].get("download", False),
     )
+    if ds_key not in train_dict or ds_key not in val_dict:
+        raise KeyError(f"Dataset '{ds_key}' not found. Available: {list(train_dict.keys())}")
 
-def set_seed(seed: int):
-    import random
-    import numpy as np
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    base_train = train_dict[ds_key].dataset
+    base_val   = val_dict[ds_key].dataset
 
-# ---------------------------------------------------------
-# 데이터셋 (증강 없음, (img, label, idx) 반환)
-# ---------------------------------------------------------
-class IndexDataset(Dataset):
-    def __init__(self, base: Dataset):
-        self.base = base
-    def __len__(self): return len(self.base)
-    def __getitem__(self, idx):
-        x, y = self.base[idx]
-        return x, y, idx
+    train_ds = WithIndex(base_train)
+    val_ds   = WithIndex(base_val)
 
-def build_loaders(cfg: dict) -> Tuple[DataLoader, DataLoader, int]:
-    name = cfg["data"]["dataset"].lower()
-    root = cfg["data"]["root"]
-    bs   = int(cfg["data"]["batch_size"])
-    nw   = int(cfg["data"]["num_workers"])
-    pin  = bool(cfg["data"].get("pin_memory", True))
-    download = bool(cfg["data"].get("download", True))
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg["data"]["batch_size"],
+        shuffle=True,
+        num_workers=cfg["data"]["num_workers"],
+        pin_memory=cfg["data"].get("pin_memory", True),
+        persistent_workers=(cfg["data"]["num_workers"] > 0),
+        collate_fn=collate_with_index,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg["data"]["batch_size"],
+        shuffle=False,
+        num_workers=cfg["data"]["num_workers"],
+        pin_memory=cfg["data"].get("pin_memory", True),
+        persistent_workers=(cfg["data"]["num_workers"] > 0),
+        collate_fn=collate_with_index,
+    )
+    return train_loader, val_loader
 
-    if name == "cifar10":
-        normalize = T.Normalize((0.4914, 0.4822, 0.4465),
-                                (0.2470, 0.2435, 0.2616))
-        num_classes = 10
-        train_base = torchvision.datasets.CIFAR10(root, train=True, transform=T.Compose([T.ToTensor(), normalize]),
-                                                  download=download)
-        val_base   = torchvision.datasets.CIFAR10(root, train=False, transform=T.Compose([T.ToTensor(), normalize]),
-                                                  download=download)
-    elif name == "cifar100":
-        normalize = T.Normalize((0.5071, 0.4867, 0.4408),
-                                (0.2675, 0.2565, 0.2761))
-        num_classes = 100
-        train_base = torchvision.datasets.CIFAR100(root, train=True, transform=T.Compose([T.ToTensor(), normalize]),
-                                                   download=download)
-        val_base   = torchvision.datasets.CIFAR100(root, train=False, transform=T.Compose([T.ToTensor(), normalize]),
-                                                   download=download)
-    elif name == "stl10":
-        normalize = T.Normalize((0.4467, 0.4398, 0.4066),
-                                (0.2603, 0.2566, 0.2713))
-        num_classes = 10
-        train_base = torchvision.datasets.STL10(root, split="train", transform=T.Compose([T.ToTensor(), normalize]),
-                                                download=download)
-        val_base   = torchvision.datasets.STL10(root, split="test", transform=T.Compose([T.ToTensor(), normalize]),
-                                                download=download)
-    elif name in ["tiny_imagenet", "tiny-imagenet-200", "tinyimagenet"]:
-        # torchvision에 정식 Tiny-ImageNet이 없어서 폴더형태로 가정.
-        # 리포에서 이미 동일 구조를 쓰고 있으므로 그대로 사용.
-        # dataset/tiny-imagenet-200/train, /val 형태
-        normalize = T.Normalize((0.4802, 0.4481, 0.3975),
-                                (0.2770, 0.2691, 0.2821))
-        num_classes = 200
-        train_dir = os.path.join(root, "tiny-imagenet-200", "train")
-        val_dir   = os.path.join(root, "tiny-imagenet-200", "val")
-        transform = T.Compose([T.ToTensor(), normalize])
-        train_base = torchvision.datasets.ImageFolder(train_dir, transform=transform)
-        val_base   = torchvision.datasets.ImageFolder(val_dir, transform=transform)
+# ----------------------------
+# Models
+# ----------------------------
+def build_teacher(cfg, device: torch.device):
+    nc  = int(cfg["model"]["num_classes"])
+    arc = cfg["model"]["teacher"]["arch"]
+    tbb = cfg["model"]["teacher"]["backbone_path"]
+    tcl = cfg["model"]["teacher"]["classifier_path"]
+    teacher = load_backbone_and_classifier(tbb, tcl, arc, nc, map_location="cpu").to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    return teacher
+
+def build_student(cfg, device: torch.device):
+    nc   = int(cfg["model"]["num_classes"])
+    sckp = cfg["model"]["student"]["ckpt"]
+    student = load_student_imagenet(sckp, nc, map_location="cpu").to(device)
+    return student
+
+# ----------------------------
+# Optim / Sched (AdamW 기본, cosine)  — soft_kd와 동일
+# ----------------------------
+def build_optimizer_scheduler(cfg, model):
+    opt_cfg = cfg["train"]["optimizer"]
+    name = opt_cfg["name"].lower()
+    lr = float(opt_cfg["lr"])
+    wd = float(opt_cfg.get("weight_decay", 0.05))
+
+    if name == "adamw":
+        optim = AdamW(model.parameters(), lr=lr,
+                      betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
+                      eps=float(opt_cfg.get("eps", 1e-8)),
+                      weight_decay=wd)
+    elif name == "sgd":
+        optim = SGD(model.parameters(), lr=lr,
+                    momentum=float(opt_cfg.get("momentum", 0.9)),
+                    weight_decay=wd, nesterov=True)
     else:
-        raise ValueError(f"Unknown dataset: {name}")
+        optim = AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
-    train_ds = IndexDataset(train_base)
-    val_ds   = IndexDataset(val_base)
+    # soft_kd와 동일한 스케줄 키/형식 사용
+    sch_cfg = cfg["train"]["scheduler"]  # <-- 기존 lr_scheduler가 아님
+    warm   = int(sch_cfg.get("warmup_epochs", 0))
+    min_lr = float(sch_cfg.get("min_lr", 1e-6))
 
-    train_ld = DataLoader(train_ds, batch_size=bs, shuffle=True,  num_workers=nw, pin_memory=pin)
-    val_ld   = DataLoader(val_ds,   batch_size=bs, shuffle=False, num_workers=nw, pin_memory=pin)
-    return train_ld, val_ld, num_classes
+    # 총 epoch 계산: enable된 구간만 합산
+    total_epochs = 0
+    if cfg["train"]["linear_probe"]["enable"]:
+        total_epochs += int(cfg["train"]["linear_probe"]["epochs"])
+    if cfg["train"]["finetune"]["enable"]:
+        total_epochs += int(cfg["train"]["finetune"]["epochs"])
+    total_epochs = max(1, total_epochs)  # 0으로 나누기 안전장치
 
-# ---------------------------------------------------------
-# 모델: torchvision ResNet + ckpt 로딩
-# (repo에서 쓰는 ckpt 경로를 config에서 그대로 받아 사용)
-# ---------------------------------------------------------
-def build_resnet(arch: str, num_classes: int):
-    arch = arch.lower()
-    if arch == "resnet18":
-        m = torchvision.models.resnet18(num_classes=num_classes)
-        feat_dim = 512
-    elif arch == "resnet34":
-        m = torchvision.models.resnet34(num_classes=num_classes)
-        feat_dim = 512
-    else:
-        raise ValueError(f"Unsupported arch: {arch}")
-    return m, feat_dim
+    # warmup + cosine to min_lr
+    def lr_lambda(epoch):
+        if epoch < warm:
+            return float(epoch + 1) / max(1, warm)
+        if total_epochs <= warm:
+            return min_lr / lr
+        t = (epoch - warm) / max(1, total_epochs - warm)
+        floor = (min_lr / lr)
+        return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * t))
 
-def load_ckpt_if_exists(model: nn.Module, path: str):
-    if path and os.path.isfile(path):
-        sd = torch.load(path, map_location="cpu")
-        # state_dict or whole object 모두 지원
-        if isinstance(sd, dict) and "state_dict" in sd:
-            sd = sd["state_dict"]
-        try:
-            model.load_state_dict(sd, strict=True)
-        except Exception:
-            # 키가 앞에 'module.' 붙은 경우 등 완화
-            new_sd = {}
-            for k, v in sd.items():
-                nk = k.replace("module.", "")
-                new_sd[nk] = v
-            model.load_state_dict(new_sd, strict=False)
+    scheduler = LambdaLR(optim, lr_lambda=lr_lambda)
+    return optim, scheduler
 
-# 백본 임베딩 추출(FC 이전)
-def extract_feats(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    # torchvision resnet 기준 구현
-    x = model.conv1(x)
-    x = model.bn1(x)
-    x = model.relu(x)
-    x = model.maxpool(x)
-    x = model.layer1(x)
-    x = model.layer2(x)
-    x = model.layer3(x)
-    x = model.layer4(x)
-    x = model.avgpool(x)
-    x = torch.flatten(x, 1)
-    return x  # (B, 512)
 
-# ---------------------------------------------------------
-# Beta 스케줄
-# ---------------------------------------------------------
-class BetaScheduler:
-    def __init__(self, start_epoch: int, end_epoch: int, base: float):
-        self.s = start_epoch
-        self.e = end_epoch
-        self.base = base
-    def value(self, epoch: int) -> float:
-        if epoch <= self.s - 1:
-            return 0.0
-        if self.s <= epoch <= self.e:
-            # 선형 warm-up
-            t = (epoch - self.s + 1) / (self.e - self.s + 1)
-            return self.base * float(t)
-        return self.base
-
-# ---------------------------------------------------------
-# 로그 유틸
-# ---------------------------------------------------------
-class JsonlLogger:
-    def __init__(self, path: Path):
-        self.f = open(path, "a", encoding="utf-8")
-    def log(self, payload: Dict):
-        self.f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        self.f.flush()
+# ----------------------------
+# Utilities: feature hooks
+# ----------------------------
+class _FCInHook:
+    """fc 모듈의 입력(=최종 임베딩)을 캡처하는 forward hook"""
+    def __init__(self, fc: nn.Module):
+        self.handle = fc.register_forward_hook(self.hook)
+        self.buf = None
+    def hook(self, module, inputs, output):
+        x = inputs[0]
+        # (B, D)
+        self.buf = x.detach()
     def close(self):
-        self.f.close()
+        self.handle.remove()
 
-# ---------------------------------------------------------
-# 은행 채우기(teacher 1회 추론)
-# ---------------------------------------------------------
 @torch.no_grad()
-def ensure_teacher_banks(
-    cfg: dict,
-    teacher: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: torch.device,
-    dtype: torch.dtype,
-    num_classes: int,
-):
-    ds_name = cfg["data"]["dataset"]
-    ckpt_root = cfg["paths"]["ckpt_root"]
-    logits_path = cfg["kd"]["cache_template"]  # .../soft_targets/{dataset}_fp16.pt
-    embed_path  = cfg["rkd"]["embed_template"] # .../final_embeddings/{dataset}_fp16.pt
+def _extract_feats_for_bank(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    # teacher 모델에서 임베딩만 추출 (fc 입력 캡처)
+    assert hasattr(model, "fc"), "Expected a torchvision ResNet-like model with .fc"
+    hk = _FCInHook(model.fc)
+    _ = model(x)  # forward once
+    feats = hk.buf
+    hk.close()
+    return feats
 
-    # Logit bank
-    logit_bank = SoftTargetBank(logits_path, num_samples=len(train_loader.dataset), num_classes=num_classes)
-    emb_bank   = FinalEmbeddingBank(embed_path, num_samples=len(train_loader.dataset), feat_dim=int(cfg["rkd"].get("feat_dim", 512)))
+def forward_feats_and_logits(model: nn.Module, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """학생 모델을 한 번만 forward 해서 (feat, logits)을 함께 얻음"""
+    hk = _FCInHook(model.fc)
+    logits = model(x)
+    feats = hk.buf
+    hk.close()
+    return feats, logits
 
-    if (not logit_bank.exists()) or (not emb_bank.exists()):
-        teacher.eval()
-        cache_loader = DataLoader(
+# ----------------------------
+# Epoch Loops
+# ----------------------------
+def train_one_epoch_lp(student, teacher, bank_logits, loader, device, optimizer, kd_loss_fn, log_interval=50, use_amp=False, scaler: torch.cuda.amp.GradScaler | None = None):
+    """LP: RKD 비활성화, base KD만. BN eval 고정 가정."""
+    student.train()
+    tbar = tqdm(loader, desc="train[LP]", leave=False)
+    total_loss_sum = ce_sum = kd_sum = correct = seen = 0
+
+    for step, batch in enumerate(tbar):
+        if len(batch) == 3: x, y, idx = batch
+        else: x, y, idx = batch[0], batch[1], None
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            s_logits = student(x)
+            if bank_logits is not None and idx is not None:
+                t_logits = bank_logits.get(idx)
+            else:
+                with torch.no_grad():
+                    t_logits = teacher(x)
+            total, parts = kd_loss_fn(s_logits, t_logits, y)
+
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp and scaler is not None:
+            scaler.scale(total).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total.backward()
+            optimizer.step()
+
+        # metrics
+        bs = y.size(0)
+        total_loss_sum += float(parts["train_loss"]) * bs
+        ce_sum += float(parts["train_loss_ce"]) * bs
+        kd_sum += float(parts["train_loss_kd"]) * bs
+        pred = s_logits.detach().argmax(1)
+        correct += int((pred == y).sum())
+        seen += bs
+
+    return {
+        "train_loss": total_loss_sum / max(1, seen),
+        "train_loss_ce": ce_sum / max(1, seen),
+        "train_loss_kd": kd_sum / max(1, seen),
+        "train_loss_rkd": 0.0,
+        "train_loss_rkd_weighted": 0.0,
+        "train_acc": correct / max(1, seen),
+    }
+
+@torch.no_grad()
+def eval_one_epoch_lp(student, teacher, loader, device, kd_loss_fn):
+    """LP: 검증에서도 RKD 없음 (로그엔 0 기록)"""
+    student.eval()
+    tbar = tqdm(loader, desc="val[LP]", leave=False)
+    total_loss_sum = ce_sum = kd_sum = correct = seen = 0
+
+    for batch in tbar:
+        if len(batch) == 3: x, y, _ = batch
+        else: x, y = batch
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        s_logits = student(x)
+        t_logits = teacher(x)
+        total, parts = kd_loss_fn(s_logits, t_logits, y)
+
+        bs = y.size(0)
+        total_loss_sum += float(parts["train_loss"]) * bs
+        ce_sum += float(parts["train_loss_ce"]) * bs
+        kd_sum += float(parts["train_loss_kd"]) * bs
+        pred = s_logits.detach().argmax(1)
+        correct += int((pred == y).sum())
+        seen += bs
+
+    return {
+        "val_loss": total_loss_sum / max(1, seen),
+        "val_loss_ce": ce_sum / max(1, seen),
+        "val_loss_kd": kd_sum / max(1, seen),
+        "val_loss_rkd": 0.0,
+        "val_loss_rkd_weighted": 0.0,
+        "val_acc": correct / max(1, seen),
+    }
+
+def train_one_epoch_ft(student, teacher, bank_logits, bank_feats, loader, device, optimizer, kd_loss_fn,
+                       beta_sched: BetaScheduler, epoch_idx: int, log_interval=50, use_amp=False, scaler: torch.cuda.amp.GradScaler | None = None):
+    """FT: base KD + RKD(beta). bank_feats는 train split만 사용."""
+    student.train()
+    tbar = tqdm(loader, desc="train[FT]", leave=False)
+    total_loss_sum = ce_sum = kd_sum = rkd_sum = rkdw_sum = correct = seen = 0
+    steps = len(loader)
+
+    for step, batch in enumerate(tbar):
+        if len(batch) == 3: x, y, idx = batch
+        else: x, y, idx = batch[0], batch[1], None
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+        beta = float(beta_sched.value(epoch_idx, step))
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            s_feats, s_logits = forward_feats_and_logits(student, x)
+            if bank_logits is not None and idx is not None:
+                t_logits = bank_logits.get(idx)
+            else:
+                with torch.no_grad():
+                    t_logits = teacher(x)
+            base_total, parts = kd_loss_fn(s_logits, t_logits, y)
+
+        # RKD (skip when beta==0 for speed)
+        if beta > 0.0:
+            if bank_feats is not None and idx is not None:
+                t_feats = bank_feats.get(idx)  # (B, D)
+            else:
+                with torch.no_grad():
+                    t_feats = _extract_feats_for_bank(teacher, x)
+            rkd = compute_rkd_loss(s_feats, t_feats, beta)
+            total = base_total + rkd["loss_rkd_weighted"]
+        else:
+            rkd = {"loss_rkd": torch.tensor(0.0, device=device),
+                   "loss_rkd_weighted": torch.tensor(0.0, device=device)}
+            total = base_total
+
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp and scaler is not None:
+            scaler.scale(total).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total.backward()
+            optimizer.step()
+
+        # metrics
+        bs = y.size(0)
+        total_loss_sum += float(parts["train_loss"]) * bs + float(rkd["loss_rkd_weighted"].detach()) * bs
+        ce_sum += float(parts["train_loss_ce"]) * bs
+        kd_sum += float(parts["train_loss_kd"]) * bs
+        rkd_sum += float(rkd["loss_rkd"].detach()) * bs
+        rkdw_sum += float(rkd["loss_rkd_weighted"].detach()) * bs
+        pred = s_logits.detach().argmax(1)
+        correct += int((pred == y).sum())
+        seen += bs
+
+    return {
+        "train_loss": total_loss_sum / max(1, seen),
+        "train_loss_ce": ce_sum / max(1, seen),
+        "train_loss_kd": kd_sum / max(1, seen),
+        "train_loss_rkd": rkd_sum / max(1, seen),
+        "train_loss_rkd_weighted": rkdw_sum / max(1, seen),
+        "train_acc": correct / max(1, seen),
+    }
+
+@torch.no_grad()
+def eval_one_epoch_ft(student, teacher, loader, device, kd_loss_fn, beta_for_log: float):
+    """FT: 검증은 base KD + (옵션) RKD 측정. 로깅 편의상 beta_for_log를 받아 weighted 값도 보고."""
+    student.eval()
+    tbar = tqdm(loader, desc="val[FT]", leave=False)
+    total_loss_sum = ce_sum = kd_sum = rkd_sum = rkdw_sum = correct = seen = 0
+
+    for batch in tbar:
+        if len(batch) == 3: x, y, _ = batch
+        else: x, y = batch
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+        s_feats, s_logits = forward_feats_and_logits(student, x)
+        t_logits = teacher(x)  # val은 on-the-fly
+        base_total, parts = kd_loss_fn(s_logits, t_logits, y)
+
+        # RKD (on-the-fly)
+        t_feats = _extract_feats_for_bank(teacher, x)
+        rkd = compute_rkd_loss(s_feats, t_feats, beta_for_log if beta_for_log>0 else 0.0)
+
+        total = base_total + (rkd["loss_rkd_weighted"] if beta_for_log>0 else 0.0)
+
+        bs = y.size(0)
+        total_loss_sum += float(base_total.detach()) * bs + (float(rkd["loss_rkd_weighted"].detach()) if beta_for_log>0 else 0.0) * bs
+        ce_sum += float(parts["train_loss_ce"]) * bs
+        kd_sum += float(parts["train_loss_kd"]) * bs
+        rkd_sum += float(rkd["loss_rkd"].detach()) * bs
+        rkdw_sum += float(rkd["loss_rkd_weighted"].detach()) * bs if beta_for_log>0 else 0.0
+        pred = s_logits.detach().argmax(1)
+        correct += int((pred == y).sum())
+        seen += bs
+
+    return {
+        "val_loss": total_loss_sum / max(1, seen),
+        "val_loss_ce": ce_sum / max(1, seen),
+        "val_loss_kd": kd_sum / max(1, seen),
+        "val_loss_rkd": rkd_sum / max(1, seen),
+        "val_loss_rkd_weighted": rkdw_sum / max(1, seen),
+        "val_acc": correct / max(1, seen),
+    }
+
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    cfg = load_cfg_from_cli()
+    device = torch.device(cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
+    use_amp = str(cfg.get("precision", "fp32")).lower() == "fp16"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # 출력 경로: runs/<experiment.name>/<dataset>
+    exp_name = cfg["experiment"]["name"]
+    ds_key   = cfg["data"]["dataset"]
+    out_dir  = Path(cfg["output"]["dir"]) / exp_name / ds_key
+    (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    (out_dir / "config_used.yaml").write_text(pretty(cfg), encoding="utf-8")
+
+    # data / models
+    train_loader, val_loader = build_dataloaders_single(cfg)
+    teacher = build_teacher(cfg, device)
+    student = build_student(cfg, device)
+
+    # banks (train-only)
+    bank_logits = None
+    if cfg.get("kd", {}).get("enable", True) and cfg["kd"].get("cache_logits", True):
+        bank_logits = TeacherLogitsBank(
+            cfg["kd"]["cache_path"],
+            num_samples=len(train_loader.dataset),
+            num_classes=int(cfg["model"]["num_classes"]),
+            device=device,
+        )
+        if not bank_logits.exists():
+            cache_loader = DataLoader(
                 train_loader.dataset,
                 batch_size=cfg["data"]["batch_size"],
                 shuffle=False,
@@ -242,249 +414,134 @@ def ensure_teacher_banks(
                 pin_memory=cfg["data"].get("pin_memory", True),
                 collate_fn=collate_with_index,
             )
-        logit_bank.build(teacher, cache_loader)
-        emb_bank.build(teacher, cache_loader, extract_feats)
+            bank_logits.build(teacher, cache_loader)
 
-    # 항상 로드해 객체를 반환
-    logit_bank._ensure_loaded()
-    emb_bank._ensure_loaded()
-    return logit_bank, emb_bank
+    bank_feats = None
+    if cfg.get("rkd", {}).get("enable", True):
+        embed_path = cfg["rkd"].get("embed_path") or cfg["rkd"].get("embed_template", "src/model/ckpts/final_embeddings/{dataset}_fp16.pt").format(dataset=ds_key)
+        feat_dim = int(cfg["rkd"].get("feat_dim", student.fc.in_features))
+        bank_feats = TeacherEmbeddingBank(
+            embed_path,
+            num_samples=len(train_loader.dataset),
+            feat_dim=feat_dim,
+            device=device,
+        )
+        if not bank_feats.exists():
+            cache_loader = DataLoader(
+                train_loader.dataset,
+                batch_size=cfg["data"]["batch_size"],
+                shuffle=False,
+                num_workers=cfg["data"]["num_workers"],
+                pin_memory=cfg["data"].get("pin_memory", True),
+                collate_fn=collate_with_index,
+            )
+            bank_feats.build(teacher, cache_loader, feature_extractor=_extract_feats_for_bank)
 
-# ---------------------------------------------------------
-# 1 스텝 손실 계산
-# ---------------------------------------------------------
-def step_loss(
-    student: nn.Module,
-    batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    device: torch.device,
-    kd_ce_fn: SoftTargetKDLoss,
-    logit_bank: SoftTargetBank,
-    emb_bank: FinalEmbeddingBank,
-    beta_now: float,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    x, y, idx = batch
-    x = x.to(device, non_blocking=True)
-    y = y.to(device, non_blocking=True)
+    kd_loss = SoftTargetKDLoss(alpha=float(cfg["kd"]["alpha"]), temperature=float(cfg["kd"]["temperature"]))
+    optim, sched = build_optimizer_scheduler(cfg, student)
+    log_interval = int(cfg.get("logging", {}).get("log_interval", 50))
 
-    # student forward
-    s_logits = student(x)
-    with torch.no_grad():
-        t_logits = logit_bank.get(idx)      # (B, C) on CPU float16/32
-        t_logits = t_logits.to(device=device, dtype=s_logits.dtype)
+    jsonl_path = out_dir / "metrics_per_epoch.jsonl"
+    best_acc = -1.0
+    global_epoch = 0
 
-    # KD + CE
-    base_loss, parts = kd_ce_fn(s_logits, t_logits, y)  # keys: train_loss_ce, train_loss_kd, train_loss
+    # ---- Linear Probe ----
+    if cfg["train"]["linear_probe"]["enable"]:
+        # Freeze backbone, fc only
+        for p in student.parameters(): p.requires_grad_(False)
+        for p in student.fc.parameters(): p.requires_grad_(True)
+        num_epochs = int(cfg["train"]["linear_probe"]["epochs"])
+        for e in range(num_epochs):
+            global_epoch += 1
+            t0 = time.perf_counter()
+            tr = train_one_epoch_lp(student, teacher, bank_logits, train_loader, device, optim, kd_loss, log_interval, use_amp, scaler)
+            va = eval_one_epoch_lp(student, teacher, val_loader, device, kd_loss)
+            if sched is not None: sched.step()
+            time_sec = time.perf_counter() - t0
+            lr = float(optim.param_groups[0]["lr"])
 
-    # RKD (임베딩)
-    with torch.no_grad():
-        t_emb = emb_bank.get(idx).to(device)   # (B, D) float32
-    s_emb = extract_feats(student, x)          # (B, D)
-    rkd_dict = compute_rkd_loss(s_emb, t_emb, beta_scalar=beta_now)  # {"loss_rkd", "loss_rkd_weighted"}
+            line = {
+                "epoch": global_epoch,
+                "time_sec": time_sec,
+                "beta": 0.0,
+                "train_loss": tr["train_loss"],
+                "train_loss_ce": tr["train_loss_ce"],
+                "train_loss_kd": tr["train_loss_kd"],
+                "train_loss_rkd": tr["train_loss_rkd"],
+                "train_loss_rkd_weighted": tr["train_loss_rkd_weighted"],
+                "train_acc": tr["train_acc"],
+                "val_loss": va["val_loss"],
+                "val_loss_ce": va["val_loss_ce"],
+                "val_loss_kd": va["val_loss_kd"],
+                "val_loss_rkd": va["val_loss_rkd"],
+                "val_loss_rkd_weighted": va["val_loss_rkd_weighted"],
+                "val_acc": va["val_acc"],
+                "lr": lr,
+            }
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
 
-    # 최종 합
-    loss_total = base_loss + rkd_dict["loss_rkd_weighted"]
+            torch.save(student.state_dict(), out_dir / "checkpoints" / "last.pt")
+            if va["val_acc"] > best_acc:
+                best_acc = va["val_acc"]
+                torch.save(student.state_dict(), out_dir / "checkpoints" / "best.pt")
+                (out_dir / "best_metrics.json").write_text(
+                    json.dumps({"epoch": global_epoch, "val_acc": best_acc}), encoding="utf-8"
+                )
 
-    with torch.no_grad():
-        acc = (s_logits.argmax(dim=1) == y).float().mean()
+    # ---- Finetune ----
+    if cfg["train"]["finetune"]["enable"]:
+        for p in student.parameters(): p.requires_grad_(True)
 
-    log = {
-        "loss_ce": parts["train_loss_ce"].detach(),
-        "loss_kd": parts["train_loss_kd"].detach(),
-        "loss_rkd": rkd_dict["loss_rkd"].detach(),
-        "loss_total": loss_total.detach(),
-        "acc": acc.detach(),
-        "beta": torch.tensor(float(beta_now), device=device),
-    }
-    return loss_total, log
+        # Beta schedule
+        bs_cfg = cfg.get("rkd", {}).get("beta_schedule", {})
+        bcfg = BetaScheduleCfg(
+            start_epoch=int(bs_cfg.get("start_epoch", 21)),
+            end_epoch=int(bs_cfg.get("end_epoch", 30)),
+            base=float(bs_cfg.get("base", 50.0)),
+            stepwise=bool(bs_cfg.get("stepwise", True)),
+        )
+        beta_sched = BetaScheduler(bcfg, steps_per_epoch=max(1, len(train_loader)))
 
-# ---------------------------------------------------------
-# 학습 루프
-# ---------------------------------------------------------
-def run(cfg: dict):
-    set_seed(int(cfg.get("seed", 42)))
-    device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
-    dtype = torch.float16 if cfg.get("precision", "fp32") == "fp16" else torch.float32
+        num_epochs = int(cfg["train"]["finetune"]["epochs"])
+        for e in range(num_epochs):
+            global_epoch += 1
+            t0 = time.perf_counter()
+            tr = train_one_epoch_ft(student, teacher, bank_logits, bank_feats, train_loader, device, optim, kd_loss, beta_sched, global_epoch, log_interval, use_amp, scaler)
+            current_beta = beta_sched.value(global_epoch, len(train_loader)-1)  # epoch 끝에서의 beta
+            va = eval_one_epoch_ft(student, teacher, val_loader, device, kd_loss, beta_for_log=float(current_beta))
+            if sched is not None: sched.step()
+            time_sec = time.perf_counter() - t0
+            lr = float(optim.param_groups[0]["lr"])
 
-    # loaders
-    train_loader, val_loader, num_classes = build_loaders(cfg)
+            line = {
+                "epoch": global_epoch,
+                "time_sec": time_sec,
+                "beta": float(current_beta),
+                "train_loss": tr["train_loss"],
+                "train_loss_ce": tr["train_loss_ce"],
+                "train_loss_kd": tr["train_loss_kd"],
+                "train_loss_rkd": tr["train_loss_rkd"],
+                "train_loss_rkd_weighted": tr["train_loss_rkd_weighted"],
+                "train_acc": tr["train_acc"],
+                "val_loss": va["val_loss"],
+                "val_loss_ce": va["val_loss_ce"],
+                "val_loss_kd": va["val_loss_kd"],
+                "val_loss_rkd": va["val_loss_rkd"],
+                "val_loss_rkd_weighted": va["val_loss_rkd_weighted"],
+                "val_acc": va["val_acc"],
+                "lr": lr,
+            }
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
 
-    # models
-    st_arch = cfg["model"]["student"]["arch"]
-    tc_arch = cfg["model"]["teacher"]["arch"]
-
-    student, feat_dim = build_resnet(st_arch, num_classes)
-    teacher, _        = build_resnet(tc_arch, num_classes)
-
-    # ckpt 로딩 (학생/교사)
-    load_ckpt_if_exists(student, cfg["model"]["student"].get("ckpt", ""))
-    # teacher는 backone+classifier 템플릿 경로를 합쳐서 완모델 sd가 저장되어 있을 수도 있음
-    # 우선 전체 ckpt 경로가 있으면 우선 사용
-    if "ckpt" in cfg["model"]["teacher"] and os.path.isfile(cfg["model"]["teacher"]["ckpt"]):
-        load_ckpt_if_exists(teacher, cfg["model"]["teacher"]["ckpt"])
-    else:
-        # 분리 저장된 경우(backbone, classifier)를 best-effort로 로드
-        bb = cfg["model"]["teacher"].get("backbone_path", "")
-        cl = cfg["model"]["teacher"].get("classifier_path", "")
-        if os.path.isfile(bb):
-            sd = torch.load(bb, map_location="cpu")
-            # 백본 키 추정 불가 시, strict=False
-            try: teacher.load_state_dict(sd, strict=False)
-            except Exception: teacher.load_state_dict({k.replace("module.", ""): v for k, v in sd.items()}, strict=False)
-        if os.path.isfile(cl):
-            sd = torch.load(cl, map_location="cpu")
-            try: teacher.load_state_dict(sd, strict=False)
-            except Exception: teacher.load_state_dict({k.replace("module.", ""): v for k, v in sd.items()}, strict=False)
-
-    student = student.to(device)
-    teacher = teacher.to(device).eval()
-    for p in teacher.parameters(): p.requires_grad_(False)
-
-    # output dirs
-    exp_name = cfg.get("experiment", {}).get("name", "03_relational_kd")
-    ds_key   = cfg["data"]["dataset"]
-    out_root = Path(cfg["output"]["dir"]) / exp_name / ds_key
-    out_root.mkdir(parents=True, exist_ok=True)
-    log_train = JsonlLogger(out_root / "train.jsonl")
-    log_val   = JsonlLogger(out_root / "val.jsonl")
-    save_config_used(out_root, cfg)
-
-    # teacher banks (없으면 채우고 저장, 있으면 로드)
-    logit_bank, emb_bank = ensure_teacher_banks(
-        cfg, teacher, train_loader, val_loader, device, dtype, num_classes
-    )
-
-    # losses
-    alpha = float(cfg["kd"].get("alpha", 0.7))
-    T     = float(cfg["kd"].get("temperature", 3.0))
-    kd_ce_fn = SoftTargetKDLoss(alpha=alpha, temperature=T)
-
-    beta_cfg = cfg.get("rkd", {}).get("beta_schedule", {})
-    beta_base  = float(beta_cfg.get("base", 50.0))
-    warm_s    = int(beta_cfg.get("start_epoch", 21))
-    warm_e    = int(beta_cfg.get("end_epoch",   30))
-    beta_sched = BetaScheduler(warm_s, warm_e, beta_base)
-
-    # 옵티마이저/스케줄러 (cosine, LP/FT 구간 동일 설정)
-    opt_cfg = cfg["train"]["optimizer"]
-    lr      = float(opt_cfg.get("lr", 3e-4))
-    wd      = float(opt_cfg.get("weight_decay", 0.05))
-    betas   = tuple(opt_cfg.get("betas", (0.9, 0.999)))
-    eps     = float(opt_cfg.get("eps", 1e-8))
-
-    # Epoch 설정
-    ep_lp = int(cfg["train"]["linear_probe"]["epochs"])
-    ep_ft = int(cfg["train"]["finetune"]["epochs"])
-    total_epochs = ep_lp + ep_ft
-
-    # Linear probe: fc만 학습
-    for p in student.parameters(): p.requires_grad_(False)
-    for p in student.fc.parameters(): p.requires_grad_(True)
-    optimizer = torch.optim.AdamW(student.fc.parameters(), lr=lr, weight_decay=wd, betas=betas, eps=eps)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=ep_lp, eta_min=float(cfg["train"]["scheduler"].get("min_lr", 1e-6)))
-
-    # ----- LP phase -----
-    for epoch in range(1, ep_lp + 1):
-        student.train()
-        epoch_log = {"epoch": epoch}
-        # beta=0 (강제)
-        beta_now = 0.0
-
-        # train
-        agg = {"loss_ce": 0, "loss_kd": 0, "loss_rkd": 0, "loss_total": 0, "acc": 0}
-        n = 0
-        for batch in train_loader:
-            optimizer.zero_grad(set_to_none=True)
-            loss, parts = step_loss(student, batch, device, kd_ce_fn, logit_bank, emb_bank, beta_now)
-            loss.backward()
-            optimizer.step()
-
-            bs = batch[0].size(0)
-            for k in agg: agg[k] += float(parts[k]) * bs
-            n += bs
-
-        for k in agg: agg[k] /= max(1, n)
-        agg["beta"] = beta_now
-        agg["lr"]   = float(optimizer.param_groups[0]["lr"])
-        log_train.log({"epoch": epoch, **{f"train_{k}": v for k, v in agg.items()}})
-
-        # val
-        student.eval()
-        vagg = {"loss_ce": 0, "loss_kd": 0, "loss_rkd": 0, "loss_total": 0, "acc": 0}
-        vn = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                loss, parts = step_loss(student, batch, device, kd_ce_fn, logit_bank, emb_bank, beta_now)
-                bs = batch[0].size(0)
-                for k in vagg: vagg[k] += float(parts[k]) * bs
-                vn += bs
-        for k in vagg: vagg[k] /= max(1, vn)
-        vagg["beta"] = beta_now
-        vagg["lr"]   = float(optimizer.param_groups[0]["lr"])
-        log_val.log({"epoch": epoch, **{f"val_{k}": v for k, v in vagg.items()}})
-
-        scheduler.step()
-
-    # ----- FT phase -----
-    # 모든 파라미터 학습
-    for p in student.parameters(): p.requires_grad_(True)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=wd, betas=betas, eps=eps)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=ep_ft, eta_min=float(cfg["train"]["scheduler"].get("min_lr", 1e-6)))
-
-    for i, epoch in enumerate(range(ep_lp + 1, total_epochs + 1), start=1):
-        student.train()
-        beta_now = beta_sched.value(epoch)  # 21~30 warm-up, 이후 고정
-        agg = {"loss_ce": 0, "loss_kd": 0, "loss_rkd": 0, "loss_total": 0, "acc": 0}
-        n = 0
-        for batch in train_loader:
-            optimizer.zero_grad(set_to_none=True)
-            loss, parts = step_loss(student, batch, device, kd_ce_fn, logit_bank, emb_bank, beta_now)
-            loss.backward()
-            optimizer.step()
-
-            bs = batch[0].size(0)
-            for k in agg: agg[k] += float(parts[k]) * bs
-            n += bs
-        for k in agg: agg[k] /= max(1, n)
-        agg["beta"] = beta_now
-        agg["lr"]   = float(optimizer.param_groups[0]["lr"])
-        log_train.log({"epoch": epoch, **{f"train_{k}": v for k, v in agg.items()}})
-
-        # val
-        student.eval()
-        vagg = {"loss_ce": 0, "loss_kd": 0, "loss_rkd": 0, "loss_total": 0, "acc": 0}
-        vn = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                loss, parts = step_loss(student, batch, device, kd_ce_fn, logit_bank, emb_bank, beta_now)
-                bs = batch[0].size(0)
-                for k in vagg: vagg[k] += float(parts[k]) * bs
-                vn += bs
-        for k in vagg: vagg[k] /= max(1, vn)
-        vagg["beta"] = beta_now
-        vagg["lr"]   = float(optimizer.param_groups[0]["lr"])
-        log_val.log({"epoch": epoch, **{f"val_{k}": v for k, v in vagg.items()}})
-
-        scheduler.step()
-
-    log_train.close()
-    log_val.close()
-
-# ---------------------------------------------------------
-# CLI
-# ---------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, action="append", required=True,
-                        help="하나 이상 지정 가능. 앞에서 뒤로 덮어씀")
-    args = parser.parse_args()
-
-    # 여러 yaml을 순서대로 deep merge
-    cfg = {}
-    for p in args.config:
-        cfg = deep_merge(cfg, load_yaml(p))
-    cfg = format_templates(cfg)
-
-    run(cfg)
+            torch.save(student.state_dict(), out_dir / "checkpoints" / "last.pt")
+            if va["val_acc"] > best_acc:
+                best_acc = va["val_acc"]
+                torch.save(student.state_dict(), out_dir / "checkpoints" / "best.pt")
+                (out_dir / "best_metrics.json").write_text(
+                    json.dumps({"epoch": global_epoch, "val_acc": best_acc}), encoding="utf-8"
+                )
 
 if __name__ == "__main__":
     main()
